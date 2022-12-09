@@ -25,4 +25,8 @@ build/
 
 x64/
 x86/
-*idb
+
+.idea/
+*vcxproj
+*vcxproj.filters
+*sln
