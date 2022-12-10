@@ -45,6 +45,7 @@ namespace ycnet
         
         inline std::vector<std::thread> worker_threads;
 
+
         enum COMPLETION_KEY {
             CK_STOP = 0,
             CK_START = 1
@@ -71,7 +72,6 @@ namespace ycnet
                     PAGE_READWRITE));
         }
 
-
         struct rio_udp_server_controller {
             std::function<void()> kill;
         };
@@ -80,7 +80,6 @@ namespace ycnet
             EXTENDED_RIO_BUF* send_buf;
             __int64 send_buf_index;
 
-            /// ADDR용 RIO_BUF pointer
             EXTENDED_RIO_BUF* addr_buf;
             __int64 addr_buf_index;
 
@@ -99,14 +98,93 @@ namespace ycnet
             char* addr_buf_ptr;
         };
 
+
+        struct endpoint_t {
+            // 192.128.0.1
+            u_char ip1; 
+            u_char ip2; 
+            u_char ip3; 
+            u_char ip4;
+
+            u_short port;
+            std::string to_string() const {
+                return std::to_string(ip1) + "." + std::to_string(ip2) + "." + std::to_string(ip3) + "." + std::to_string(ip4);
+            }
+
+            sockaddr_in to_sockaddr_in() const {
+                sockaddr_in addr;
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(port);
+                addr.sin_addr.S_un.S_un_b.s_b1 = ip1;
+                addr.sin_addr.S_un.S_un_b.s_b2 = ip2;
+                addr.sin_addr.S_un.S_un_b.s_b3 = ip3;
+                addr.sin_addr.S_un.S_un_b.s_b4 = ip4;
+                return addr;
+            }
+            
+            void set_ip(const sockaddr_in* addr) {
+                ip1 = addr->sin_addr.S_un.S_un_b.s_b1;
+                ip2 = addr->sin_addr.S_un.S_un_b.s_b2;
+                ip3 = addr->sin_addr.S_un.S_un_b.s_b3;
+                ip4 = addr->sin_addr.S_un.S_un_b.s_b4;
+                port = ntohs(addr->sin_port);
+            }
+        };
+        
+        static std::vector<rio_t> rios;
+
+        /// <summary>
+        /// send가 thread safe 하지 않기 때문에 호출 할 때 알아서 해줘야함.
+        /// </summary>
+        /** 
+         * \brief 
+         * \param buf 전송할 데이터 
+         * \param size 전송할 데이터 크기
+         * \param addr 전송할 주소
+         * \param thread_number 전송할 스레드 번호, 스레드 번호는 스레드의 개수보다 작아야함.
+         * \return 
+         */
+        yc::err_opt_t<int> send_udp(const char* buf, int size, const endpoint_t addr, const int thread_number) {
+            auto& rio = rios[thread_number];
+            
+            EXTENDED_RIO_BUF* context = &rio.send_buf[rio.send_buf_index];
+            char* send_offset = rio.send_buf_ptr + context->Offset;
+            std::copy_n(buf, size, send_offset);
+
+            const auto addr_data = &rio.addr_buf[rio.addr_buf_index];
+            char* addr_offset = rio.addr_buf_ptr + addr_data->Offset;
+
+            const auto addr_in = addr.to_sockaddr_in();
+            std::copy_n(&addr_in, sizeof(sockaddr_in), addr_offset);
+
+            rio.send_buf_index = (rio.send_buf_index + 1) % SEND_BUFFER_COUNT;
+            rio.addr_buf_index = (rio.addr_buf_index + 1) % ADDR_BUFFER_COUNT;
+
+            if (!g_rio.RIOSendEx(
+                rio.rq,
+                context,
+                1,
+                nullptr,
+                addr_data,
+                nullptr,
+                nullptr,
+                0,
+                context)) return ERR_TEXT(RIOSend);
+            return yc::err_opt_t(size);
+        }
+        
         inline yc::err_opt_t<rio_udp_server_controller> UDP_CORE(
             const int thread_count,
-            const u_short port
+            const u_short port,
+            const std::function<void(const char*, int, endpoint_t)>& recv_callback
             )
         {
             worker_threads.reserve(thread_count);
-            static std::vector<rio_t> rios(thread_count);
+            rios.reserve(thread_count);
 
+            for(int i =0; i < thread_count; ++i)
+                rios.emplace_back();
+            
             static WSADATA data;
             if (::WSAStartup(0x202, &data)) return ERR_TEXT(WSAStartup);
 
@@ -267,7 +345,7 @@ namespace ycnet
                     &send_buf,
                     &addr_buf_index,
                     &send_buf_index,
-                    thread_number]
+                    thread_number, recv_callback]
                 {
             
                     DWORD number_of_bytes = 0;
@@ -279,7 +357,6 @@ namespace ycnet
                         if (!::GetQueuedCompletionStatus(g_h_iocp, &number_of_bytes, &completion_key, &overlapped_ptr, INFINITE))
                             return ERR_TEXT(GetQueuedCompletionStatus);
 
-                        /// ck로 0이 넘어오면 끝낸다
                         if (completion_key == CK_STOP) break;
 
                         memset(results, 0, sizeof(results));
@@ -292,34 +369,21 @@ namespace ycnet
                         for (DWORD i = 0; i < num_results; ++i) {
                             if (const auto buffer_ptr = reinterpret_cast<EXTENDED_RIO_BUF*>(results[i].RequestContext);
                                 OP_RECV == buffer_ptr->operation) {
+
                                 /// UDP니까 송신자측에서 보낸 데이터가 전부 안오는 경우는 에러
                                 if (results[i].BytesTransferred != RECV_BUFFER_SIZE) break;
 
                                 ///// ECHO TEST
                                 const char* source = recv_buf_ptr + buffer_ptr->Offset;
 
-                                EXTENDED_RIO_BUF* context = &send_buf[send_buf_index];
-
-                                send_buf_index = (send_buf_index + 1) % SEND_BUFFER_COUNT;
+                                auto addr_ptr = reinterpret_cast<sockaddr_in*>(addr_buf + buffer_ptr->Offset);
+                                endpoint_t endpoint;
+                                endpoint.set_ip(addr_ptr);
+                                recv_callback(source, results[i].BytesTransferred, endpoint);
                                 
-                                char* send_offset = send_buf_ptr + context->Offset;
-                                memcpy_s(send_offset, RECV_BUFFER_SIZE, source, buffer_ptr->Length);
-
                                 /// TEST PRINT
                                 //cout << strlen(sendOffset) << " ";
 
-                                if (!g_rio.RIOSendEx(
-                                    rq,
-                                    context,
-                                    1,
-                                    nullptr,
-                                    &addr_buf[addr_buf_index % ADDR_BUFFER_COUNT],
-                                    nullptr,
-                                    nullptr,
-                                    0,
-                                    context)) return ERR_TEXT(RIOSend);
-                            }
-                            else if (OP_SEND == buffer_ptr->operation) {
                                 if (!g_rio.RIOReceiveEx(
                                     rq,
                                     buffer_ptr,
@@ -331,6 +395,11 @@ namespace ycnet
                                     0,
                                     buffer_ptr)) return ERR_TEXT(RIOReceive);
                                 addr_buf_index = (addr_buf_index + 1) % ADDR_BUFFER_COUNT;
+                                
+
+                            }
+                            else if (OP_SEND == buffer_ptr->operation) {
+
                             }
                             else break;
                         }
