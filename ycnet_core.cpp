@@ -1,7 +1,4 @@
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include "ycnet_core.hpp"
-
-
 
 struct client_t {
     ycnet::core::endpoint_t endpoint;
@@ -25,8 +22,11 @@ int main()
         send_udp(clients[0].name.c_str(), 3, clients[0].endpoint, clients[0].my_thread_number);
     });
 
+    if(!server.has_value()) {
+        printf("server error : %s\n", server.err.c_str());
+    }
+    
     while(true) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    return 0;
 }
