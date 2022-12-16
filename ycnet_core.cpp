@@ -9,18 +9,32 @@ struct client_t {
 int main()
 {
     std::unordered_map<ycnet::core::endpoint_t, client_t> clients;
-
-    const auto server = ycnet::core::UDP_CORE(4, 1234, [&clients](const char* buf, const int len, const ycnet::core::endpoint_t ip) {
-        clients[ip] = client_t{ ip, std::string(buf, len), 0 };
-        //clients.emplace_back();
-        //clients.back().endpoint = ip;
-        //clients.back().name = buf;
-        //clients.back().my_thread_number = 0;
+    std::unordered_map<std::thread::id, int> id_map;
+    std::atomic_int thread_number = 0;
+    srw_lock clients_lock;
+    const auto server = ycnet::core::UDP_CORE(4, 1234, [&clients, &clients_lock, &id_map, &thread_number](const char* buf, const int len, const ycnet::core::endpoint_t ep) {
+        if(!id_map.contains(std::this_thread::get_id()))
+            id_map[std::this_thread::get_id()] = thread_number++;
         
-        std::cout << "recv: " << buf << std::endl;
-        std::cout << "from: " << ip.to_string() << ":" << ip.port << std::endl;
-
-        //send_udp(clients[0].name.c_str(), 3, clients[0].endpoint, clients[0].my_thread_number);
+        if(!clients.contains(ep)) {
+            w_srw_lock_guard g{ clients_lock };
+            clients[ep] = client_t{ ep, std::string(buf, len), 0 };
+            std::cout << "New client: " << clients[ep].name << std::endl;
+        }else {
+            std::cout << "recv: " << buf << std::endl;
+            std::cout << "from: " << ep.to_string() << std::endl;
+            std::vector<ycnet::core::endpoint_t> r;
+            r.reserve(clients.size());
+            {
+                w_srw_lock_guard g{ clients_lock };
+                for(const auto& key : clients | std::views::keys) {
+                    r.emplace_back(key);
+                }
+            }
+            for(const auto& _ep : r) {
+                ycnet::core::send_udp(buf, len, _ep, id_map[std::this_thread::get_id()]);
+            }
+        }
     }, printf);
 
     if(!server.has_value()) {

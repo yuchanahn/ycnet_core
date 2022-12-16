@@ -85,45 +85,19 @@ namespace ycnet
         char* recv_buf_ptr;
         char* addr_buf_ptr;
 
-        struct endpoint_t {
-            u_char ip1;
-            u_char ip2;
-            u_char ip3;
-            u_char ip4;
-            u_short port;
-
+        // 엔드포인트를 사용할 때 메모리 복사가 일어나는데 그것을 방지해야함.
+        // 아마 Union으로 구현하면 될 것 같음.
+        struct endpoint_t : SOCKADDR_IN {
             std::string to_string() const {
-                return std::to_string(ip1) + "." + std::to_string(ip2) + "." + std::to_string(ip3) + "." +
-                    std::to_string(ip4);
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &sin_addr, ip, INET_ADDRSTRLEN);
+                return std::format("{}:{}", ip, ntohs(sin_port));
             }
-            sockaddr_in to_sockaddr_in() const {
-                sockaddr_in addr;
-                addr.sin_family = AF_INET;
-                addr.sin_port = htons(port);
-                addr.sin_addr.S_un.S_un_b.s_b1 = ip1;
-                addr.sin_addr.S_un.S_un_b.s_b2 = ip2;
-                addr.sin_addr.S_un.S_un_b.s_b3 = ip3;
-                addr.sin_addr.S_un.S_un_b.s_b4 = ip4;
-                return addr;
-            }
-            void set_ip(const sockaddr_in* addr) {
-                ip1 = addr->sin_addr.S_un.S_un_b.s_b1;
-                ip2 = addr->sin_addr.S_un.S_un_b.s_b2;
-                ip3 = addr->sin_addr.S_un.S_un_b.s_b3;
-                ip4 = addr->sin_addr.S_un.S_un_b.s_b4;
-                port = ntohs(addr->sin_port);
-            }
-
-            endpoint_t(u_char ip1, u_char ip2, u_char ip3, u_char ip4, u_short port) : ip1(ip1), ip2(ip2), ip3(ip3), ip4(ip4), port(port) {}
-            endpoint_t() : ip1(0), ip2(0), ip3(0), ip4(0), port(0) {}
             friend std::hash<endpoint_t>;
             friend bool operator==(const endpoint_t& my, const endpoint_t& other) {
-                return my.ip1 == other.ip1 && my.ip2 == other.ip2 && my.ip3 == other.ip3 && my.ip4 == other.ip4 && my.port == other.port;
+                return my.sin_addr.S_un.S_addr == other.sin_addr.S_un.S_addr && my.sin_port == other.sin_port;
             }
         };
-
-
-        
         struct pooled_recv_data_t {
             DWORD read_buf_size;
             DWORD read_buf_offset;
@@ -145,7 +119,8 @@ namespace ycnet
         inline bool is_running = true;
         static auto is_not_used = [](const auto& x) { return !x.is_used; };
         static auto is_used = [](const auto& x) { return x.is_used; };
-        
+
+
         /** 
          * \brief send가 thread safe 하지 않기 때문에 호출 할 때 알아서 해줘야함.
          * \param buf 전송할 데이터 
@@ -155,15 +130,22 @@ namespace ycnet
          * \return 전송한 바이트 크기
          */
         yc::err_opt_t<int> send_udp(const char* buf, int size, const endpoint_t addr, const int thread_number) {
-            // busy wait
-            while (std::ranges::empty(send_bufs[thread_number] | std::views::filter(is_not_used))) 
-                std::this_thread::sleep_for(std::chrono::microseconds(1));
+
+            if(size > SEND_BUFFER_SIZE) {
+                return ERR_TEXT(SEND SIZE > SEND_BUFFER_SIZE(1024));
+            }
             
+            // busy wait
+            while (std::ranges::empty(send_bufs[thread_number] | std::views::filter(is_not_used))) {
+                std::this_thread::sleep_for(std::chrono::microseconds(1));
+            }
             for(auto& context : send_bufs[thread_number] | std::views::filter(is_not_used)) {
                 char* send_offset = send_buf_ptr + context.buf.Offset;
                 std::copy_n(buf, size, send_offset);
-                const auto addr_in = addr.to_sockaddr_in();
-                std::copy_n((char*)&addr_in, sizeof(sockaddr_in), addr_buf_ptr + context.addr_buf.Offset);
+                std::copy_n((char*)&addr, sizeof(sockaddr_in), addr_buf_ptr + context.addr_buf.Offset);
+                context.buf.Length = size;
+                context.is_used = true;
+                
                 g_cqrq_lock.w_lock();
                 const auto r = g_rio_ft.RIOSendEx(
                     g_rq,
@@ -176,7 +158,6 @@ namespace ycnet
                     0,
                     &context.buf);
                 g_cqrq_lock.w_unlock();
-                
                 if (!r)
                         return ERR_TEXT(RIOSend);
                 return yc::err_opt_t(size);
@@ -266,7 +247,9 @@ namespace ycnet
                         buf.BufferId = send_buf_id;
                         buf.Offset = offset;
                         buf.Length = SEND_BUFFER_SIZE;
-
+                        buf.index = j;
+                        buf.thread_number = i;
+                        is_used = false;
                         offset += SEND_BUFFER_SIZE;
                     }
                 }
@@ -340,10 +323,8 @@ namespace ycnet
                             if (const auto buffer_ptr = reinterpret_cast<EXTENDED_RIO_BUF*>(results[i].RequestContext);
                                 OP_RECV == buffer_ptr->operation) {
                                 const char* source = recv_buf_ptr + buffer_ptr->Offset;
-                                const auto addr_ptr = reinterpret_cast<sockaddr_in*>(addr_buf_ptr + addr_buf[buffer_ptr->index].Offset);
-                                endpoint_t endpoint{};
-                                endpoint.set_ip(addr_ptr);
-                                recv_callback(source, static_cast<int>(results[i].BytesTransferred), endpoint);
+                                const auto addr_ptr = reinterpret_cast<endpoint_t*>(addr_buf_ptr + addr_buf[buffer_ptr->index].Offset);
+                                recv_callback(source, static_cast<int>(results[i].BytesTransferred), *addr_ptr);
                                 if(auto r = bind_receive_udp(buffer_ptr); !r.has_value()) io_thread_msg_callback(r.err.c_str());
                             }
                             else if (OP_SEND == buffer_ptr->operation) {
@@ -392,11 +373,9 @@ template <>
 struct std::hash<ycnet::core::endpoint_t> {
     size_t operator()(const ycnet::core::endpoint_t &ep) const noexcept { 
         size_t hash = 0;
-        hash_combine(hash, ep.ip1);
-        hash_combine(hash, ep.ip2);
-        hash_combine(hash, ep.ip3);
-        hash_combine(hash, ep.ip4);
-        hash_combine(hash, ep.port);
+        hash_combine(hash, ep.sin_family);
+        hash_combine(hash, ep.sin_port);
+        hash_combine(hash, ep.sin_addr.s_addr);
         return hash;
     }                                                                    
 };
