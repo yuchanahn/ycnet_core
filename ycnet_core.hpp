@@ -12,13 +12,14 @@
 #include <thread>
 #include <WS2tcpip.h>
 #include <ranges>
+#include <unordered_map>
 
 #include "yc_framework/ycutil.hpp"
+#include "yc_framework/srw_lock.hpp"
 
 #pragma comment(lib, "ws2_32.lib")
 
 #define ERR_TEXT(msg) std::format("{} Error: {}", #msg , ::GetLastError()).c_str()
-
 
 namespace ycnet
 {
@@ -26,7 +27,8 @@ namespace ycnet
     {
         inline RIO_EXTENSION_FUNCTION_TABLE g_rio_ft;
         inline SOCKET g_socket;
-
+        inline srw_lock g_cqrq_lock;
+        
         enum RIO_Config {
             RIO_PENDING_RECVS = 1000,
             RIO_PENDING_SENDS = 1000,
@@ -70,7 +72,7 @@ namespace ycnet
         }
 
         struct rio_udp_server_controller {
-            std::function<void()> kill;
+            std::function<yc::err_opt_t<int>()> kill;
         };
 
         EXTENDED_RIO_BUF* addr_buf;
@@ -84,19 +86,16 @@ namespace ycnet
         char* addr_buf_ptr;
 
         struct endpoint_t {
-            // 192.128.0.1
             u_char ip1;
             u_char ip2;
             u_char ip3;
             u_char ip4;
-
             u_short port;
 
             std::string to_string() const {
                 return std::to_string(ip1) + "." + std::to_string(ip2) + "." + std::to_string(ip3) + "." +
                     std::to_string(ip4);
             }
-
             sockaddr_in to_sockaddr_in() const {
                 sockaddr_in addr;
                 addr.sin_family = AF_INET;
@@ -107,7 +106,6 @@ namespace ycnet
                 addr.sin_addr.S_un.S_un_b.s_b4 = ip4;
                 return addr;
             }
-
             void set_ip(const sockaddr_in* addr) {
                 ip1 = addr->sin_addr.S_un.S_un_b.s_b1;
                 ip2 = addr->sin_addr.S_un.S_un_b.s_b2;
@@ -115,8 +113,17 @@ namespace ycnet
                 ip4 = addr->sin_addr.S_un.S_un_b.s_b4;
                 port = ntohs(addr->sin_port);
             }
+
+            endpoint_t(u_char ip1, u_char ip2, u_char ip3, u_char ip4, u_short port) : ip1(ip1), ip2(ip2), ip3(ip3), ip4(ip4), port(port) {}
+            endpoint_t() : ip1(0), ip2(0), ip3(0), ip4(0), port(0) {}
+            friend std::hash<endpoint_t>;
+            friend bool operator==(const endpoint_t& my, const endpoint_t& other) {
+                return my.ip1 == other.ip1 && my.ip2 == other.ip2 && my.ip3 == other.ip3 && my.ip4 == other.ip4 && my.port == other.port;
+            }
         };
 
+
+        
         struct pooled_recv_data_t {
             DWORD read_buf_size;
             DWORD read_buf_offset;
@@ -132,8 +139,10 @@ namespace ycnet
             EXTENDED_RIO_BUF addr_buf;
             volatile bool is_used;
         };
-        inline std::vector<std::vector<send_buf_t>> send_bufs;
 
+        
+        inline std::vector<std::vector<send_buf_t>> send_bufs;
+        inline bool is_running = true;
         static auto is_not_used = [](const auto& x) { return !x.is_used; };
         static auto is_used = [](const auto& x) { return x.is_used; };
         
@@ -147,8 +156,7 @@ namespace ycnet
          */
         yc::err_opt_t<int> send_udp(const char* buf, int size, const endpoint_t addr, const int thread_number) {
             // busy wait
-            while (send_bufs[thread_number]  | std::views::filter(is_not_used)
-                                             | std::views::empty) 
+            while (std::ranges::empty(send_bufs[thread_number] | std::views::filter(is_not_used))) 
                 std::this_thread::sleep_for(std::chrono::microseconds(1));
             
             for(auto& context : send_bufs[thread_number] | std::views::filter(is_not_used)) {
@@ -156,8 +164,8 @@ namespace ycnet
                 std::copy_n(buf, size, send_offset);
                 const auto addr_in = addr.to_sockaddr_in();
                 std::copy_n((char*)&addr_in, sizeof(sockaddr_in), addr_buf_ptr + context.addr_buf.Offset);
-
-                if (!g_rio_ft.RIOSendEx(
+                g_cqrq_lock.w_lock();
+                const auto r = g_rio_ft.RIOSendEx(
                     g_rq,
                     &context.buf,
                     1,
@@ -166,44 +174,39 @@ namespace ycnet
                     nullptr,
                     nullptr,
                     0,
-                    &context.buf))
+                    &context.buf);
+                g_cqrq_lock.w_unlock();
+                
+                if (!r)
                         return ERR_TEXT(RIOSend);
                 return yc::err_opt_t(size);
             }
         }
 
-        inline std::vector<std::vector<std::vector<pooled_recv_data_t>>> recv_data_pool;
-
         inline yc::err_opt_t<DWORD> bind_receive_udp(EXTENDED_RIO_BUF* buf) {
-            if (const auto data = reinterpret_cast<EXTENDED_RIO_BUF*>(recv_buf_ptr + buf->Offset);
-                !g_rio_ft.RIOReceiveEx(
+            g_cqrq_lock.w_lock();
+            const auto r = g_rio_ft.RIOReceiveEx(
                     g_rq,
-                    data,
+                    buf,
                     1,
                     nullptr,
                     &addr_buf[buf->index],
                     nullptr,
                     nullptr,
                     0,
-                    data)) return ERR_TEXT(RIOReceive);
+                    buf);
+            g_cqrq_lock.w_unlock();
+            if (!r) return ERR_TEXT(RIOReceive);
             return yc::err_opt_t(buf->index);
         }
         
         inline yc::err_opt_t<rio_udp_server_controller> UDP_CORE(
             const int thread_count,
             const u_short port,
-            const std::function<void(const char*, int, endpoint_t)>& recv_callback
+            const std::function<void(const char*, int, endpoint_t)>& recv_callback,
+            const std::function<void(const char*)>& io_thread_msg_callback
         ) {
             worker_threads.reserve(thread_count);
-            
-            for (int i = 0; i < thread_count; ++i) {
-                recv_data_pool.emplace_back();
-                for (int j = 0; j < thread_count; ++j) {
-                    if (i == j) continue;
-                    recv_data_pool[i].emplace_back();
-                    for (int k = 0; k < RIO_PENDING_RECVS; ++k) { recv_data_pool[i][j].emplace_back(); }
-                }
-            }
 
             static WSADATA data;
             if (::WSAStartup(0x202, &data)) return ERR_TEXT(WSAStartup);
@@ -224,28 +227,16 @@ namespace ycnet
 
             if (0 != WSAIoctl(g_socket,
                               SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
-                              &function_table_id,
-                              sizeof(GUID),
-                              &g_rio_ft,
-                              sizeof g_rio_ft,
+                              &function_table_id, sizeof GUID,
+                              &g_rio_ft, sizeof g_rio_ft,
                               &dw_bytes,
                               nullptr,
                               nullptr))
                 return ERR_TEXT(WSAIoctl);
 
-
-
-            // TODO :
-            // CQ, RQ 가 Thread Safe 하지 않는다?
-            // CQ, RQ를 Thread당 하나씩 만들어 둔다.
-            // 방법을 찾아보자!
-
-            
-            
             g_cq = g_rio_ft.RIOCreateCompletionQueue(RIO_PENDING_RECVS + RIO_PENDING_SENDS, nullptr);
             if (g_cq == RIO_INVALID_CQ) return ERR_TEXT(RIOCreateCompletionQueue);
 
-            /// RIO RQ 생성
             g_rq = g_rio_ft.RIOCreateRequestQueue(
                 g_socket,
                 RIO_PENDING_RECVS,
@@ -255,9 +246,8 @@ namespace ycnet
                 g_cq,
                 g_cq,
                 nullptr);
+            
             if (g_rq == RIO_INVALID_RQ) return ERR_TEXT(RIOCreateRequestQueue);
-
-            /// SEND용 RIO 버퍼 등록
             {
                 send_bufs.reserve(thread_count);
                 send_buf_ptr = allocate_buf(RIO_PENDING_SENDS * SEND_BUFFER_SIZE);
@@ -314,21 +304,16 @@ namespace ycnet
                 }
             }
             
-
             recv_buf_ptr = allocate_buf(RIO_PENDING_RECVS * RECV_BUFFER_SIZE);
-
             recv_buf_id = g_rio_ft.RIORegisterBuffer(recv_buf_ptr, RIO_PENDING_RECVS * RECV_BUFFER_SIZE);
             if (recv_buf_id == RIO_INVALID_BUFFERID) return ERR_TEXT(RIORegisterBuffer);
-
             offset = 0;
-
             const auto buf = new EXTENDED_RIO_BUF[RIO_PENDING_RECVS];
 
             for (DWORD j = 0; j < RIO_PENDING_RECVS; ++j) {
                 EXTENDED_RIO_BUF* buffer_ptr = buf + j;
 
                 buffer_ptr->operation = OP_RECV;
-                buffer_ptr->thread_number = min(j / (RIO_PENDING_RECVS / thread_count), (DWORD)thread_count - 1);
                 buffer_ptr->index = j;
                 buffer_ptr->BufferId = recv_buf_id;
                 buffer_ptr->Offset = offset;
@@ -339,78 +324,47 @@ namespace ycnet
             }
 
             for (int i = 0; i < thread_count; ++i) {
-                auto thread_number = i;
-                
-                worker_threads.emplace_back([thread_number, recv_callback, thread_count] {
-                    while (true) {
+                worker_threads.emplace_back([thread_number = i, recv_callback, io_thread_msg_callback] {
+                    while (is_running) {
                         RIORESULT results[RIO_MAX_RESULTS] = {};
 
-                        const ULONG num_results = g_rio_ft.RIODequeueCompletion(g_cq, results, RIO_MAX_RESULTS);
-
+                        g_cqrq_lock.w_lock();
+                        const ULONG r_num = g_rio_ft.RIODequeueCompletion(g_cq, results, RIO_MAX_RESULTS);
+                        g_cqrq_lock.w_unlock();
                         
-                        
-                        if (0 == num_results) {
-                            bool do_something = false;
-                            for(int i = 0; i < thread_count; ++i) {
-                                if (i == thread_number) continue;
-                                for (auto& data : recv_data_pool[i][thread_number] | std::views::filter(is_used)) {
-                                    recv_callback(recv_buf_ptr + data.read_buf_offset, static_cast<int>(data.read_buf_size), data.endpoint);
-                                    data.is_used = false;
-                                    if(auto r = bind_receive_udp(reinterpret_cast<EXTENDED_RIO_BUF*>(recv_buf_ptr + data.read_buf_offset));
-                                        !r.has_value()) return r.err.c_str();
-                                    do_something = true;
-                                }
-                            }
-                            if(!do_something) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        if (0 == r_num) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
                             continue;
                         }
-                        for (DWORD i = 0; i < num_results; ++i) {
+                        for (DWORD i = 0; i < r_num; ++i) {
                             if (const auto buffer_ptr = reinterpret_cast<EXTENDED_RIO_BUF*>(results[i].RequestContext);
                                 OP_RECV == buffer_ptr->operation) {
                                 const char* source = recv_buf_ptr + buffer_ptr->Offset;
-
-                                const auto addr_ptr = reinterpret_cast<sockaddr_in*>(addr_buf + buffer_ptr->Offset);
+                                const auto addr_ptr = reinterpret_cast<sockaddr_in*>(addr_buf_ptr + addr_buf[buffer_ptr->index].Offset);
                                 endpoint_t endpoint{};
                                 endpoint.set_ip(addr_ptr);
-
-                                if (buffer_ptr->thread_number == thread_number) {
-                                    recv_callback(source, static_cast<int>(results[i].BytesTransferred), endpoint);
-
-                                    if(auto r = bind_receive_udp(buffer_ptr); !r.has_value()) return r.err.c_str();
-                                } else {
-                                    auto& recv_target = recv_data_pool[thread_number][buffer_ptr->thread_number];
-
-                                    // busy wait
-                                    while (recv_target  | std::views::filter(is_not_used)
-                                                        | std::views::empty) {
-                                        std::this_thread::sleep_for(std::chrono::microseconds(1));
-                                    }
-                                    for (auto& item : recv_target | std::views::filter(is_not_used)
-                                                                  | std::views::take(1)) item = {
-                                        buffer_ptr->Offset,
-                                        results[i].BytesTransferred,
-                                        endpoint,
-                                        true
-                                    };
-                                }
+                                recv_callback(source, static_cast<int>(results[i].BytesTransferred), endpoint);
+                                if(auto r = bind_receive_udp(buffer_ptr); !r.has_value()) io_thread_msg_callback(r.err.c_str());
                             }
-                            else if (OP_SEND == buffer_ptr->operation) {}
-                            else break;
+                            else if (OP_SEND == buffer_ptr->operation) {
+                                send_bufs[buffer_ptr->thread_number][buffer_ptr->index].is_used = false;
+                            }
+                            else {
+                                io_thread_msg_callback(ERR_TEXT(Unknown operation));
+                                break;
+                            }
                         }
                     }
                     std::stringstream ss;
                     ss << std::this_thread::get_id();
                     std::string str = ss.str();
-
-                    return std::format(" -- thread[{} : id-{}] exit -- ", thread_number, str).c_str();
+                    io_thread_msg_callback(std::format(" -- thread[{} : id-{}] exit -- \n", thread_number, str).c_str());
                 });
             }
 
             return yc::err_opt_t(rio_udp_server_controller{
-                [] {
-                    //if (0 == ::PostQueuedCompletionStatus(g_h_iocp, 0, CK_STOP, nullptr))
-                        //return ERR_TEXT(PostQueuedCompletionStatus);
-
+                []()->yc::err_opt_t<int> {
+                    is_running = false;
                     std::ranges::for_each(worker_threads, [](std::thread& t) { t.join(); });
 
                     if (SOCKET_ERROR == ::closesocket(g_socket)) return ERR_TEXT(closesocket);
@@ -420,9 +374,29 @@ namespace ycnet
                     g_rio_ft.RIODeregisterBuffer(recv_buf_id);
                     g_rio_ft.RIODeregisterBuffer(addr_buf_id);
 
-                    return "SUCCESS!";
+                    return yc::err_opt_t(1);
                 }
             });
         }
     }
 }
+
+template <class T>
+void hash_combine(std::size_t & s, const T & v)
+{
+    std::hash<T> h;
+    s^= h(v) + 0x9e3779b9 + (s<< 6) + (s>> 2);
+}
+
+template <>
+struct std::hash<ycnet::core::endpoint_t> {
+    size_t operator()(const ycnet::core::endpoint_t &ep) const noexcept { 
+        size_t hash = 0;
+        hash_combine(hash, ep.ip1);
+        hash_combine(hash, ep.ip2);
+        hash_combine(hash, ep.ip3);
+        hash_combine(hash, ep.ip4);
+        hash_combine(hash, ep.port);
+        return hash;
+    }                                                                    
+};
