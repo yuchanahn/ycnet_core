@@ -131,9 +131,7 @@ namespace ycnet
          */
         yc::err_opt_t<int> send_udp(const char* buf, int size, const endpoint_t addr, const int thread_number) {
 
-            if(size > SEND_BUFFER_SIZE) {
-                return ERR_TEXT(SEND SIZE > SEND_BUFFER_SIZE(1024));
-            }
+            if(size > SEND_BUFFER_SIZE) return ERR_TEXT(SEND SIZE > SEND_BUFFER_SIZE(1024));
             
             // busy wait
             while (std::ranges::empty(send_bufs[thread_number] | std::views::filter(is_not_used))) {
@@ -184,7 +182,7 @@ namespace ycnet
         inline yc::err_opt_t<rio_udp_server_controller> UDP_CORE(
             const int thread_count,
             const u_short port,
-            const std::function<void(const char*, int, endpoint_t)>& recv_callback,
+            const std::function<void(const char*, int, endpoint_t, int)>& recv_callback,
             const std::function<void(const char*)>& io_thread_msg_callback
         ) {
             worker_threads.reserve(thread_count);
@@ -324,7 +322,7 @@ namespace ycnet
                                 OP_RECV == buffer_ptr->operation) {
                                 const char* source = recv_buf_ptr + buffer_ptr->Offset;
                                 const auto addr_ptr = reinterpret_cast<endpoint_t*>(addr_buf_ptr + addr_buf[buffer_ptr->index].Offset);
-                                recv_callback(source, static_cast<int>(results[i].BytesTransferred), *addr_ptr);
+                                recv_callback(source, static_cast<int>(results[i].BytesTransferred), *addr_ptr, thread_number);
                                 if(auto r = bind_receive_udp(buffer_ptr); !r.has_value()) io_thread_msg_callback(r.err.c_str());
                             }
                             else if (OP_SEND == buffer_ptr->operation) {

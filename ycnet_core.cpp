@@ -9,12 +9,10 @@ struct client_t {
 int main()
 {
     std::unordered_map<ycnet::core::endpoint_t, client_t> clients;
-    std::unordered_map<std::thread::id, int> id_map;
-    std::atomic_int thread_number = 0;
     srw_lock clients_lock;
-    const auto server = ycnet::core::UDP_CORE(4, 1234, [&clients, &clients_lock, &id_map, &thread_number](const char* buf, const int len, const ycnet::core::endpoint_t ep) {
-        if(!id_map.contains(std::this_thread::get_id()))
-            id_map[std::this_thread::get_id()] = thread_number++;
+    
+    const auto server = ycnet::core::UDP_CORE(4, 1234, [&clients, &clients_lock]
+        (const char* buf, const int len, const ycnet::core::endpoint_t ep, int thread_num) {
         
         if(!clients.contains(ep)) {
             w_srw_lock_guard g{ clients_lock };
@@ -32,7 +30,7 @@ int main()
                 }
             }
             for(const auto& _ep : r) {
-                ycnet::core::send_udp(buf, len, _ep, id_map[std::this_thread::get_id()]);
+                send_udp(buf, len, _ep, thread_num);
             }
         }
     }, printf);
