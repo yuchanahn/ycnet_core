@@ -6,12 +6,11 @@ struct client_t {
     int my_thread_number{};
 };
 
-int main()
-{
+int main() {
     std::unordered_map<ycnet::core::endpoint_t, client_t> clients;
     srw_lock clients_lock;
     
-    const auto server = ycnet::core::UDP_CORE(4, 1234, [&clients, &clients_lock]
+    const auto server = ycnet::core::udp_server_run(4, 1234, [&clients, &clients_lock]
         (const char* buf, const int len, const ycnet::core::endpoint_t ep, int thread_num) {
         
         if(!clients.contains(ep)) {

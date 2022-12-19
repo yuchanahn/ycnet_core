@@ -179,7 +179,7 @@ namespace ycnet
             return yc::err_opt_t(buf->index);
         }
         
-        inline yc::err_opt_t<rio_udp_server_controller> UDP_CORE(
+        inline yc::err_opt_t<rio_udp_server_controller> udp_server_run(
             const int thread_count,
             const u_short port,
             const std::function<void(const char*, int, endpoint_t, int)>& recv_callback,
