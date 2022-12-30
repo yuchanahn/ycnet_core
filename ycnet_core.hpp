@@ -160,6 +160,7 @@ namespace ycnet
                         return ERR_TEXT(RIOSend);
                 return yc::err_opt_t(size);
             }
+            return ERR_TEXT(NO SEND BUFFER);
         }
 
         inline yc::err_opt_t<DWORD> bind_receive_udp(EXTENDED_RIO_BUF* buf) {
